@@ -1,5 +1,6 @@
 using System;
 using Emby.Server.Implementations.Library;
+using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Model.Entities;
 using Xunit;
 
@@ -114,5 +115,52 @@ public class MediaStreamSelectorTests
         var languagePref = new[] { "eng", "fre" };
 
         Assert.Equal(expectedScore, MediaStreamSelector.GetStreamScore(stream, languagePref));
+    }
+
+    [Fact]
+    public void SetSubtitleStreamScores_AlwaysModeNoFullSubtitle_FallsBackToForced()
+    {
+        var forcedStream = new MediaStream
+        {
+            Index = 1,
+            Type = MediaStreamType.Subtitle,
+            Language = "eng",
+            IsForced = true
+        };
+
+        var streams = new[] { forcedStream };
+
+        MediaStreamSelector.SetSubtitleStreamScores(streams, new[] { "eng" }, SubtitlePlaybackMode.Always, "jpn");
+
+        // No full (non-forced) subtitle of the preferred language exists, so OnlyForced behavior applies
+        // and the forced stream must still be scored.
+        Assert.NotNull(forcedStream.Score);
+    }
+
+    [Fact]
+    public void SetSubtitleStreamScores_AlwaysModeWithFullSubtitle_PrefersFullSubtitle()
+    {
+        var forcedStream = new MediaStream
+        {
+            Index = 1,
+            Type = MediaStreamType.Subtitle,
+            Language = "eng",
+            IsForced = true
+        };
+
+        var fullStream = new MediaStream
+        {
+            Index = 2,
+            Type = MediaStreamType.Subtitle,
+            Language = "eng",
+            IsForced = false
+        };
+
+        var streams = new[] { forcedStream, fullStream };
+
+        MediaStreamSelector.SetSubtitleStreamScores(streams, new[] { "eng" }, SubtitlePlaybackMode.Always, "jpn");
+
+        Assert.NotNull(fullStream.Score);
+        Assert.Null(forcedStream.Score);
     }
 }
