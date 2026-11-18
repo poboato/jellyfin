@@ -563,5 +563,71 @@ namespace Emby.Server.Implementations.Library
 
             item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray();
         }
+
+        /// <inheritdoc />
+        public void RemapPlaybackStreamSelections(BaseItem item, IReadOnlyDictionary<int, int?> indexMap)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+            ArgumentNullException.ThrowIfNull(indexMap);
+
+            if (indexMap.Count == 0)
+            {
+                return;
+            }
+
+            using var dbContext = _repository.CreateDbContext();
+            var rows = dbContext.UserData
+                .Where(e => e.ItemId == item.Id && (e.AudioStreamIndex != null || e.SubtitleStreamIndex != null))
+                .ToList();
+
+            var changedUserIds = new HashSet<Guid>();
+            foreach (var row in rows)
+            {
+                var audio = Remap(row.AudioStreamIndex, indexMap);
+                var subtitle = Remap(row.SubtitleStreamIndex, indexMap);
+                if (audio != row.AudioStreamIndex || subtitle != row.SubtitleStreamIndex)
+                {
+                    row.AudioStreamIndex = audio;
+                    row.SubtitleStreamIndex = subtitle;
+                    changedUserIds.Add(row.UserId);
+                }
+            }
+
+            if (changedUserIds.Count == 0)
+            {
+                return;
+            }
+
+            dbContext.SaveChanges();
+
+            var internalUserIds = dbContext.Users
+                .Where(u => changedUserIds.Contains(u.Id))
+                .Select(u => u.InternalId)
+                .ToList();
+
+            foreach (var internalUserId in internalUserIds)
+            {
+                var cacheKey = GetCacheKey(internalUserId, item.Id);
+                if (_cache.TryGet(cacheKey, out var cached))
+                {
+                    cached.AudioStreamIndex = Remap(cached.AudioStreamIndex, indexMap);
+                    cached.SubtitleStreamIndex = Remap(cached.SubtitleStreamIndex, indexMap);
+                    _cache.AddOrUpdate(cacheKey, cached);
+                }
+            }
+
+            item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray();
+
+            static int? Remap(int? index, IReadOnlyDictionary<int, int?> map)
+            {
+                // null is "nothing remembered" and -1 is "subtitles off"; neither names a stream.
+                if (index is null or -1)
+                {
+                    return index;
+                }
+
+                return map.TryGetValue(index.Value, out var newIndex) ? newIndex : index;
+            }
+        }
     }
 }

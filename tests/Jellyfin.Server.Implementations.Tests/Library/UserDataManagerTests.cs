@@ -253,4 +253,81 @@ public sealed class UserDataManagerTests : IDisposable
         var item = CreateAudioBook();
         Assert.Throws<ArgumentNullException>(() => _userDataManager.GetUserData(null!, item));
     }
+
+    [Fact]
+    public void RemapPlaybackStreamSelections_MovesEveryUsersSelectionAndKeepsOff()
+    {
+        var item = CreateAudioBook();
+        var otherItem = CreateAudioBook();
+        var otherUser = new User("other", "auth-provider", "reset-provider") { Id = Guid.NewGuid() };
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.Users.AddRange(_user, otherUser);
+            ctx.BaseItems.Add(new BaseItemEntity { Id = item.Id, Type = typeof(AudioBook).FullName! });
+            ctx.BaseItems.Add(new BaseItemEntity { Id = otherItem.Id, Type = typeof(AudioBook).FullName! });
+
+            var mine = CreateUserDataRow(item, item.GetUserDataKeys()[0], 0);
+            mine.AudioStreamIndex = 2;
+            mine.SubtitleStreamIndex = 0;
+
+            var theirs = CreateUserDataRow(item, item.GetUserDataKeys()[0], 0);
+            theirs.UserId = otherUser.Id;
+            theirs.AudioStreamIndex = 3;
+            theirs.SubtitleStreamIndex = -1;
+
+            var unrelated = CreateUserDataRow(otherItem, otherItem.GetUserDataKeys()[0], 0);
+            unrelated.AudioStreamIndex = 2;
+
+            ctx.UserData.AddRange(mine, theirs, unrelated);
+            ctx.SaveChanges();
+        }
+
+        // old layout: external sub 0, video 1, jpn 2, eng 3; new layout: video 0, jpn 1, eng 2, external sub 3
+        _userDataManager.RemapPlaybackStreamSelections(item, new Dictionary<int, int?> { [0] = 3, [1] = 0, [2] = 1, [3] = 2 });
+
+        using (var ctx = CreateDbContext())
+        {
+            var mineAfter = ctx.UserData.Single(e => e.ItemId.Equals(item.Id) && e.UserId.Equals(_user.Id));
+            Assert.Equal(1, mineAfter.AudioStreamIndex);
+            Assert.Equal(3, mineAfter.SubtitleStreamIndex);
+
+            var theirsAfter = ctx.UserData.Single(e => e.ItemId.Equals(item.Id) && e.UserId.Equals(otherUser.Id));
+            Assert.Equal(2, theirsAfter.AudioStreamIndex);
+            Assert.Equal(-1, theirsAfter.SubtitleStreamIndex);
+
+            Assert.Equal(2, ctx.UserData.Single(e => e.ItemId.Equals(otherItem.Id)).AudioStreamIndex);
+        }
+    }
+
+    [Fact]
+    public void RemapPlaybackStreamSelections_StreamGone_ClearsSelectionAndUpdatesCache()
+    {
+        var item = CreateAudioBook();
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.Users.Add(_user);
+            ctx.BaseItems.Add(new BaseItemEntity { Id = item.Id, Type = typeof(AudioBook).FullName! });
+            var row = CreateUserDataRow(item, item.GetUserDataKeys()[0], 0);
+            row.AudioStreamIndex = 1;
+            row.SubtitleStreamIndex = 4;
+            ctx.UserData.Add(row);
+            ctx.SaveChanges();
+        }
+
+        // The batch read caches the row, so a stale cached copy would show up on the second batch read.
+        Assert.Equal(4, _userDataManager.GetUserDataBatch([item], _user)[item.Id].SubtitleStreamIndex);
+
+        _userDataManager.RemapPlaybackStreamSelections(item, new Dictionary<int, int?> { [4] = null });
+
+        var cached = _userDataManager.GetUserDataBatch([item], _user)[item.Id];
+        Assert.Equal(1, cached.AudioStreamIndex);
+        Assert.Null(cached.SubtitleStreamIndex);
+
+        // The item's preloaded rows are refreshed too, which is what GetUserData reads.
+        var preloaded = _userDataManager.GetUserData(_user, item)!;
+        Assert.Equal(1, preloaded.AudioStreamIndex);
+        Assert.Null(preloaded.SubtitleStreamIndex);
+    }
 }

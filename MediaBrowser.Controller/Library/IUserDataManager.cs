@@ -106,5 +106,16 @@ namespace MediaBrowser.Controller.Library
         /// <param name="user">The user.</param>
         /// <param name="item">The item.</param>
         void ResetPlaybackStreamSelections(User user, BaseItem item);
+
+        /// <summary>
+        /// Moves every user's stored audio and subtitle stream selection for an item to the stream's new index
+        /// after a refresh renumbered the item's streams.
+        /// </summary>
+        /// <param name="item">The item.</param>
+        /// <param name="indexMap">
+        /// Previous index to new index for each stream that moved; <c>null</c> clears a selection whose stream is gone.
+        /// Indexes not in the map are left as they are.
+        /// </param>
+        void RemapPlaybackStreamSelections(BaseItem item, IReadOnlyDictionary<int, int?> indexMap);
     }
 }

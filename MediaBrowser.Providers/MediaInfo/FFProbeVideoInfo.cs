@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Persistence;
@@ -43,6 +45,8 @@ namespace MediaBrowser.Providers.MediaInfo
         private readonly SubtitleResolver _subtitleResolver;
         private readonly IMediaAttachmentRepository _mediaAttachmentRepository;
         private readonly IMediaStreamRepository _mediaStreamRepository;
+        private readonly IUserDataManager _userDataManager;
+        private readonly IPathManager _pathManager;
 
         public FFProbeVideoInfo(
             ILogger<FFProbeVideoInfo> logger,
@@ -57,7 +61,9 @@ namespace MediaBrowser.Providers.MediaInfo
             AudioResolver audioResolver,
             SubtitleResolver subtitleResolver,
             IMediaAttachmentRepository mediaAttachmentRepository,
-            IMediaStreamRepository mediaStreamRepository)
+            IMediaStreamRepository mediaStreamRepository,
+            IUserDataManager userDataManager,
+            IPathManager pathManager)
         {
             _logger = logger;
             _mediaSourceManager = mediaSourceManager;
@@ -72,6 +78,8 @@ namespace MediaBrowser.Providers.MediaInfo
             _subtitleResolver = subtitleResolver;
             _mediaAttachmentRepository = mediaAttachmentRepository;
             _mediaStreamRepository = mediaStreamRepository;
+            _userDataManager = userDataManager;
+            _pathManager = pathManager;
         }
 
         public async Task<ItemUpdateType> ProbeVideo<T>(
@@ -194,7 +202,9 @@ namespace MediaBrowser.Providers.MediaInfo
             IReadOnlyList<MediaAttachment> mediaAttachments;
             ChapterInfo[] chapters;
 
-            await AddExternalAudioAsync(video, mediaStreams, options, cancellationToken).ConfigureAwait(false);
+            var previousStreams = video.GetMediaStreams();
+
+            var externalAudioStreams = await GetExternalAudioAsync(video, options, cancellationToken).ConfigureAwait(false);
 
             if (mediaInfo is not null)
             {
@@ -230,8 +240,21 @@ namespace MediaBrowser.Providers.MediaInfo
                 chapters = [];
             }
 
-            // Download and insert external streams before the streams from the file to preserve stream IDs on remote videos
-            await AddExternalSubtitlesAsync(video, mediaStreams, options, cancellationToken).ConfigureAwait(false);
+            var externalSubtitleStreams = await GetExternalSubtitlesAsync(video, mediaStreams.Concat(externalAudioStreams).ToList(), options, cancellationToken).ConfigureAwait(false);
+
+            if (video.IsShortcut)
+            {
+                // A .strm file is not probed during a scan, so its embedded streams are unknown until the first
+                // playback probes it. External streams go first so the indexes a client saw before that stay valid.
+                mediaStreams.InsertRange(0, externalSubtitleStreams.Concat(externalAudioStreams));
+            }
+            else
+            {
+                // External streams go after the streams from the file, so adding or removing a sidecar file does not
+                // renumber the embedded streams. Their index then also matches the stream number inside the file.
+                mediaStreams.AddRange(externalAudioStreams);
+                mediaStreams.AddRange(externalSubtitleStreams);
+            }
 
             for (var i = 0; i < mediaStreams.Count; i++)
             {
@@ -270,6 +293,8 @@ namespace MediaBrowser.Providers.MediaInfo
             video.HasSubtitles = mediaStreams.Any(i => i.Type == MediaStreamType.Subtitle);
 
             _mediaStreamRepository.SaveMediaStreams(video.Id, mediaStreams, cancellationToken);
+
+            FollowRenumberedStreams(video, previousStreams, mediaStreams);
 
             _mediaAttachmentRepository.SaveMediaAttachments(video.Id, mediaAttachments, cancellationToken);
 
@@ -538,16 +563,16 @@ namespace MediaBrowser.Providers.MediaInfo
         }
 
         /// <summary>
-        /// Adds the external subtitles.
+        /// Finds the external subtitles, downloading missing ones when the library asks for it.
         /// </summary>
         /// <param name="video">The video.</param>
-        /// <param name="currentStreams">The current streams.</param>
+        /// <param name="currentStreams">The other streams of the video, used to decide what to download.</param>
         /// <param name="options">The refreshOptions.</param>
         /// <param name="cancellationToken">The cancellation token.</param>
-        /// <returns>Task.</returns>
-        private async Task AddExternalSubtitlesAsync(
+        /// <returns>The external subtitle streams.</returns>
+        private async Task<IReadOnlyList<MediaStream>> GetExternalSubtitlesAsync(
             Video video,
-            List<MediaStream> currentStreams,
+            IReadOnlyList<MediaStream> currentStreams,
             MetadataRefreshOptions options,
             CancellationToken cancellationToken)
         {
@@ -583,19 +608,18 @@ namespace MediaBrowser.Providers.MediaInfo
 
             video.SubtitleFiles = externalSubtitleStreams.Select(i => i.Path).Distinct().ToArray();
 
-            currentStreams.InsertRange(0, externalSubtitleStreams);
+            return externalSubtitleStreams;
         }
 
         /// <summary>
-        /// Adds the external audio.
+        /// Finds the external audio.
         /// </summary>
         /// <param name="video">The video.</param>
-        /// <param name="currentStreams">The current streams.</param>
         /// <param name="options">The refreshOptions.</param>
         /// <param name="cancellationToken">The cancellation token.</param>
-        private async Task AddExternalAudioAsync(
+        /// <returns>The external audio streams.</returns>
+        private async Task<IReadOnlyList<MediaStream>> GetExternalAudioAsync(
             Video video,
-            List<MediaStream> currentStreams,
             MetadataRefreshOptions options,
             CancellationToken cancellationToken)
         {
@@ -603,7 +627,48 @@ namespace MediaBrowser.Providers.MediaInfo
 
             video.AudioFiles = externalAudioStreams.Select(i => i.Path).Distinct().ToArray();
 
-            currentStreams.AddRange(externalAudioStreams);
+            return externalAudioStreams;
+        }
+
+        /// <summary>
+        /// Carries everything keyed on a stream index over to the new indexes after a refresh renumbered the streams.
+        /// </summary>
+        /// <param name="video">The video.</param>
+        /// <param name="previousStreams">The streams stored before the refresh.</param>
+        /// <param name="currentStreams">The streams stored by the refresh.</param>
+        private void FollowRenumberedStreams(Video video, IReadOnlyList<MediaStream> previousStreams, IReadOnlyList<MediaStream> currentStreams)
+        {
+            if (previousStreams.Count == 0)
+            {
+                return;
+            }
+
+            var indexMap = MediaStreamIndexMap.Build(previousStreams, currentStreams);
+            if (indexMap.Count == 0)
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "Stream indexes of {Path} changed ({Changes}); following them in remembered selections and the subtitle cache",
+                video.Path,
+                string.Join(", ", indexMap.Select(i => i.Key.ToString(CultureInfo.InvariantCulture) + "->" + (i.Value?.ToString(CultureInfo.InvariantCulture) ?? "gone"))));
+
+            _userDataManager.RemapPlaybackStreamSelections(video, indexMap);
+
+            // Extracted subtitles are cached by stream index, so a cached file may now belong to another track.
+            var subtitleFolder = _pathManager.GetSubtitleFolderPath(video.Id.ToString("N", CultureInfo.InvariantCulture));
+            if (subtitleFolder is not null && Directory.Exists(subtitleFolder))
+            {
+                try
+                {
+                    Directory.Delete(subtitleFolder, true);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Could not clear the subtitle cache {Folder} after its stream indexes changed", subtitleFolder);
+                }
+            }
         }
 
         /// <summary>

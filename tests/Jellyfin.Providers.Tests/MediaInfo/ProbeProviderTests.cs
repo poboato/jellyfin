@@ -4,6 +4,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.Lyrics;
@@ -49,7 +50,9 @@ public class ProbeProviderTests
             new NamingOptions(),
             Mock.Of<ILyricManager>(),
             Mock.Of<IMediaAttachmentRepository>(),
-            Mock.Of<IMediaStreamRepository>());
+            Mock.Of<IMediaStreamRepository>(),
+            Mock.Of<IUserDataManager>(),
+            Mock.Of<IPathManager>());
     }
 
     [Fact]
